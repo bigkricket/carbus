@@ -521,7 +521,7 @@ class SocketCAN(CANBase, CANInterfaceUtils):
 		if addr is None:
 			raise ValueError("Invalid Address: {}".format(addr))
 
-		frame = CANFrame()
+		frame = CanFrame()
 		frame.load(data, addr, rtr, ext)
 
 		fd = self.fileno()
@@ -538,7 +538,7 @@ class SocketCAN(CANBase, CANInterfaceUtils):
 			CANFrame object containing the data from the frame.
 		"""
 		fd = self.fileno()
-		frame = CANFrame()
+		frame = CanFrame()
 		numBytes = sizeof(frame)
 		ret = libc.read(fd, byref(frame), numBytes)
 		if ret != numBytes:

@@ -2,8 +2,7 @@
 File: CANProtocol.py
 
 This module contains the implementation of a protocol interface for the
-raw SocketCAN sockets. I was previously using the DatagramProtocol
-as an interface template but this is now not sufficient.
+raw SocketCAN sockets. 
 """
 
 from asyncio import Protocol
@@ -14,8 +13,8 @@ class CANProtocol(Protocol):
 	manage CAN frames and allow for the user to create services that
 	use a SocketCAN-based socket.
 	"""
-
 	def __init__(self):
+		super(CANProtocol, self).__init__()
 		self.transport = None
 		self.socket = None
 		

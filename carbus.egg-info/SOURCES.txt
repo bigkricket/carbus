@@ -1,0 +1,6 @@
+README.md
+setup.py
+carbus.egg-info/PKG-INFO
+carbus.egg-info/SOURCES.txt
+carbus.egg-info/dependency_links.txt
+carbus.egg-info/top_level.txt

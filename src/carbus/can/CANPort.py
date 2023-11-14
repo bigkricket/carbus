@@ -54,7 +54,7 @@ class ICANTransport(Interface):
 class AlreadyConnectedError(RuntimeError):
 	pass
 
-@implementer(interfaces.IListeningPort, ICANTransport, interfaces.ISystemHandle)
+#@implementer(interfaces.IListeningPort, ICANTransport, interfaces.ISystemHandle)
 class CANPort(Transport):
 	addressFamily = socket.AF_CAN
 	socketType = socket.SOCK_RAW
@@ -65,7 +65,7 @@ class CANPort(Transport):
 	def __init__(self, ifname, proto, loop=None):
 		"""Create a new CAN port object
 		@param ifname name of the CAN interface, such as `can0`
-		@param proto object implementing the CANProtocol interface
+		@param proto object impackages=find_packages(where="src"),plementing the CANProtocol interface
 		  that receives messages from the bus.
 		@param filters list of CANFilter objects that are the
 		  default filters for the port.
@@ -90,7 +90,7 @@ class CANPort(Transport):
 		if self.loop is None:
 			self.loop = asyncio.get_event_loop()
 		self._bindSocket()
-		self._connectToProtocol(self.protocol)
+		self._connectToProtocol()
 
 	def stopListening(self):
 		if self.socket:
@@ -115,7 +115,7 @@ class CANPort(Transport):
 			logging.debug(traceback.format_exc())
 			return
 		try:
-			self.protocol.frameReceived(frame)
+			asyncio.create_task(self.protocol.frameReceived(frame))
 		except Exception as exc:
 			logging.error("{} frameReceived: {}".format(self.ifname, exc))
 			logging.debug(traceback.format_exc())
@@ -162,7 +162,7 @@ class CANPort(Transport):
 		logging.info(f"CANProtocol starting on {self.ifname}")
 
 		self.socket = skt
-		self.fileno = self.socket.fileno
+		self.fileno = self.socket.fileno()
 
 	def _connectToProtocol(self):
 		self.protocol.makeConnection(self)
