@@ -375,7 +375,7 @@ class DoCANProtocol(CANProtocol):
 		await self.state_machine.trigger_event(self.state_machine.stop)
 
 	async def frameReceived(self, frame):
-		print(frame)
+		await self.frame_recieved(frame)
 
 	########################
 	# State Machine
@@ -384,11 +384,10 @@ class DoCANProtocol(CANProtocol):
 	def idle(self):
 		logging.info(f"{self.name} Waiting for frames.")
 	
-	@asyncio.coroutine
-	def frame_recieved(self, frame):
-		pci_type, length = self._get_pci_type(frame)
+	async def frame_recieved(self, frame):
+		pci_type, length = self._get_pci(frame)
 		#NOTE CANFD can have the payload be greater than 8 bytes but I assume we're using classic CAN
-		if pci_type == N_PCItype.SF_N_PDU & length <= 8:
+		if pci_type == N_PCItype.SF_N_PDU.value and length <= 8:
 			self.process_single_frame(frame)
 		elif pci_type != N_PCItype.SF_N_PDU:
 		#@TODO implement logic for other N_PCItypes
@@ -409,7 +408,7 @@ class DoCANProtocol(CANProtocol):
 	
 	def process_single_frame(self, frame):
 		"""Customise this class by overwritting this method	"""
-		pass
+		print(frame)
 
 
 ########################################################

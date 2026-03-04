@@ -54,7 +54,6 @@ class ICANTransport(Interface):
 class AlreadyConnectedError(RuntimeError):
 	pass
 
-#@implementer(interfaces.IListeningPort, ICANTransport, interfaces.ISystemHandle)
 class CANPort(Transport):
 	addressFamily = socket.AF_CAN
 	socketType = socket.SOCK_RAW
@@ -69,8 +68,7 @@ class CANPort(Transport):
 		  that receives messages from the bus.
 		@param filters list of CANFilter objects that are the
 		  default filters for the port.
-		@param reactor reactor to use for this port, if None, we use
-		  the default global reactor.
+		@param loop asyncio loop to use for this port, if None we will create one.
 		"""
 		super().__init__(self)
 

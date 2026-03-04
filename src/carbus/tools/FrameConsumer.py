@@ -76,4 +76,4 @@ class FrameConsumer(DoCANProtocol):
 	def process_single_frame(self, frame):
 		self.cur_raw_frame = frame
 		frame = self.transform(frame)	
-		self.loop.call_soon(self.transform, frame)
+		#self.loop.call_soon(self.transform, frame)
