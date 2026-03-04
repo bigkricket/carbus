@@ -194,6 +194,7 @@ def plot_visuals(
     frames: List[Frame],
     numeric_signal_series: Dict[str, List[Tuple[float, float]]],
     outdir: Path,
+    show: bool,
 ) -> bool:
     try:
         import matplotlib.pyplot as plt  # local import for clearer runtime failure
@@ -211,14 +212,18 @@ def plot_visuals(
         idx = min(bins - 1, int((fr.ts - t0) / duration * bins))
         bucket_counts[idx] += 1
     bucket_x = [t0 + (duration * (i + 0.5) / bins) for i in range(bins)]
+    figs = []
+
     fig, ax = plt.subplots(figsize=(12, 4))
+    figs.append(fig)
     ax.plot([x - t0 for x in bucket_x], bucket_counts, linewidth=1.2)
     ax.set_title("CAN Frame Rate Over Time")
     ax.set_xlabel("Seconds since start")
     ax.set_ylabel(f"Frames per ~{duration / bins:.2f}s bin")
     fig.tight_layout()
     fig.savefig(outdir / "frame_rate.png", dpi=150)
-    plt.close(fig)
+    if not show:
+        plt.close(fig)
 
     # Plot 2: top CAN IDs.
     counts = Counter(fr.can_id for fr in frames)
@@ -226,6 +231,7 @@ def plot_visuals(
     ids = [f"{cid:03X}" for cid, _ in top]
     vals = [c for _, c in top]
     fig, ax = plt.subplots(figsize=(12, 5))
+    figs.append(fig)
     ax.bar(ids, vals)
     ax.set_title("Top CAN IDs by Frame Count")
     ax.set_xlabel("CAN ID (hex)")
@@ -233,7 +239,8 @@ def plot_visuals(
     ax.tick_params(axis="x", rotation=45)
     fig.tight_layout()
     fig.savefig(outdir / "top_can_ids.png", dpi=150)
-    plt.close(fig)
+    if not show:
+        plt.close(fig)
 
     # Plot 3: OBD numeric signals, if any.
     if numeric_signal_series:
@@ -242,6 +249,7 @@ def plot_visuals(
         cols = 2
         rows = math.ceil(n / cols)
         fig, axes = plt.subplots(rows, cols, figsize=(14, max(3 * rows, 4)))
+        figs.append(fig)
         axes_list = axes.flatten() if hasattr(axes, "flatten") else [axes]
         for i, key in enumerate(keys):
             ax = axes_list[i]
@@ -257,7 +265,12 @@ def plot_visuals(
         fig.suptitle("Decoded OBD-II Numeric Signals")
         fig.tight_layout()
         fig.savefig(outdir / "obd_signals.png", dpi=150)
-        plt.close(fig)
+        if not show:
+            plt.close(fig)
+    if show:
+        plt.show()
+        for fig in figs:
+            plt.close(fig)
     return True
 
 
@@ -285,6 +298,11 @@ def parse_args() -> argparse.Namespace:
         "--response-max",
         default="0x7EF",
         help="Highest OBD response ID to decode",
+    )
+    parser.add_argument(
+        "--show",
+        action="store_true",
+        help="Open interactive matplotlib windows in addition to saving PNGs",
     )
     return parser.parse_args()
 
@@ -330,7 +348,7 @@ def main() -> int:
                 numeric_series[signal_name].append((fr.ts, numeric_val))
 
     write_decoded_csv(decoded_rows, outdir / "decoded_obd_signals.csv")
-    plotted = plot_visuals(frames, numeric_series, outdir)
+    plotted = plot_visuals(frames, numeric_series, outdir, show=args.show)
 
     with (outdir / "summary.txt").open("w", encoding="utf-8") as f:
         f.write(f"log: {log_path}\n")
@@ -350,6 +368,8 @@ def main() -> int:
             print(f"Wrote: {outdir / 'obd_signals.png'}")
         else:
             print("No numeric OBD-II signal series found for plotting.")
+        if args.show:
+            print("Displayed interactive plot windows.")
     else:
         print("matplotlib not installed; skipped PNG visualizations.")
     return 0
