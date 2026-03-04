@@ -132,7 +132,7 @@ def extract_bits_msb(data: bytes, bix: int, blen: int) -> Optional[int]:
     return (buf >> shift) & ((1 << blen) - 1)
 
 
-def decode_signal(signal_def: Dict, data_bytes: bytes) -> Tuple[Optional[float], str]:
+def decode_signal(signal_def: Dict, data_bytes: bytes) -> Tuple[Optional[float], str, str]:
     fmt = signal_def.get("fmt") or {}
     bix = int(fmt.get("bix", 0))
     blen = int(fmt.get("len", 0))
@@ -140,16 +140,16 @@ def decode_signal(signal_def: Dict, data_bytes: bytes) -> Tuple[Optional[float],
     sid = str(signal_def.get("id") or signal_def.get("name") or "signal")
     unit = str(fmt.get("unit") or "")
     if raw is None:
-        return None, f"{sid}=<n/a>"
+        return None, f"{sid}=<n/a>", unit
 
     if "map" in fmt and isinstance(fmt["map"], dict):
         mapped = fmt["map"].get(str(raw))
         if isinstance(mapped, dict):
             value = mapped.get("value", mapped.get("description", raw))
-            return None, f"{sid}={value}"
+            return None, f"{sid}={value}", unit
         if mapped is not None:
-            return None, f"{sid}={mapped}"
-        return float(raw), f"{sid}={raw}"
+            return None, f"{sid}={mapped}", unit
+        return float(raw), f"{sid}={raw}", unit
 
     val = float(raw)
     if "mul" in fmt:
@@ -162,10 +162,12 @@ def decode_signal(signal_def: Dict, data_bytes: bytes) -> Tuple[Optional[float],
         rendered = str(int(val))
     else:
         rendered = f"{val:.6f}".rstrip("0").rstrip(".")
-    return val, f"{sid}={rendered}" + (f" {unit}" if unit else "")
+    return val, f"{sid}={rendered}" + (f" {unit}" if unit else ""), unit
 
 
-def decode_mode01_frame(frame: Frame, pid_defs: Dict[int, Dict]) -> List[Tuple[str, Optional[float], str]]:
+def decode_mode01_frame(
+    frame: Frame, pid_defs: Dict[int, Dict]
+) -> List[Tuple[str, Optional[float], str, str]]:
     # Positive service 01 response is 0x41: [len, 0x41, pid, ...]
     if len(frame.data) < 3 or frame.data[1] != 0x41:
         return []
@@ -174,11 +176,11 @@ def decode_mode01_frame(frame: Frame, pid_defs: Dict[int, Dict]) -> List[Tuple[s
     if cmd is None:
         return []
     dbytes = response_data_bytes(frame.data)
-    out: List[Tuple[str, Optional[float], str]] = []
+    out: List[Tuple[str, Optional[float], str, str]] = []
     for sig in cmd.get("signals", []):
         signal_name = str(sig.get("id") or sig.get("name") or f"PID_{pid:02X}")
-        num, rendered = decode_signal(sig, dbytes)
-        out.append((signal_name, num, rendered))
+        num, rendered, unit = decode_signal(sig, dbytes)
+        out.append((signal_name, num, rendered, unit))
     return out
 
 
@@ -224,9 +226,10 @@ def write_plot_guide(
         f.write(
             f"- Orange bars are in configured OBD response range: 0x{resp_min:X}..0x{resp_max:X}.\n\n"
         )
-        f.write("obd_signals.png\n")
-        f.write("- Time series of decoded numeric OBD-II signals (if present).\n")
-        f.write("- Each subplot is one signal decoded from Mode 01 responses.\n\n")
+        f.write("obd_signals*.png\n")
+        f.write("- Time series of all decoded numeric OBD-II signals (if present).\n")
+        f.write("- Each subplot is one signal decoded from Mode 01 responses.\n")
+        f.write("- Y axis uses the signal unit/metric from PID definitions.\n\n")
         f.write("Run Summary\n")
         f.write("-----------\n")
         f.write(f"Duration (s): {duration_s:.3f}\n")
@@ -243,6 +246,7 @@ def write_plot_guide(
 def plot_visuals(
     frames: List[Frame],
     numeric_signal_series: Dict[str, List[Tuple[float, float]]],
+    signal_units: Dict[str, str],
     outdir: Path,
     show: bool,
     resp_min: int,
@@ -332,35 +336,37 @@ def plot_visuals(
 
     # Plot 3: OBD numeric signals, if any.
     if numeric_signal_series:
-        keys = sorted(
-            numeric_signal_series.keys(),
-            key=lambda k: len(numeric_signal_series[k]),
-            reverse=True,
-        )[:12]
-        n = len(keys)
-        cols = 1 if n <= 4 else 2
-        rows = math.ceil(n / cols)
-        fig, axes = plt.subplots(rows, cols, figsize=(14, max(3 * rows, 4)), sharex=True)
-        figs.append(fig)
-        axes_list = axes.flatten() if hasattr(axes, "flatten") else [axes]
-        for i, key in enumerate(keys):
-            ax = axes_list[i]
-            series = numeric_signal_series[key]
-            xs = [x - t0 for x, _ in series]
-            ys = [y for _, y in series]
-            ax.plot(xs, ys, linewidth=1.2, color="#2a9d8f")
-            ax.scatter(xs, ys, s=5, alpha=0.35, color="#2a9d8f")
-            ax.set_title(key)
-            ax.set_xlabel("Seconds")
-            ax.set_ylabel("Value")
-            ax.grid(True, alpha=0.35)
-        for j in range(n, len(axes_list)):
-            axes_list[j].axis("off")
-        fig.suptitle("Decoded OBD-II Numeric Signals (Top 12 by sample count)")
-        fig.tight_layout()
-        fig.savefig(outdir / "obd_signals.png", dpi=150)
-        if not show:
-            plt.close(fig)
+        keys = sorted(numeric_signal_series.keys())
+        per_fig = 12
+        total_pages = math.ceil(len(keys) / per_fig)
+        for page in range(total_pages):
+            page_keys = keys[page * per_fig : (page + 1) * per_fig]
+            n = len(page_keys)
+            cols = 1 if n <= 4 else 2
+            rows = math.ceil(n / cols)
+            fig, axes = plt.subplots(rows, cols, figsize=(14, max(3 * rows, 4)), sharex=True)
+            figs.append(fig)
+            axes_list = axes.flatten() if hasattr(axes, "flatten") else [axes]
+            for i, key in enumerate(page_keys):
+                ax = axes_list[i]
+                series = numeric_signal_series[key]
+                xs = [x - t0 for x, _ in series]
+                ys = [y for _, y in series]
+                ax.plot(xs, ys, linewidth=1.2, color="#2a9d8f")
+                ax.scatter(xs, ys, s=5, alpha=0.35, color="#2a9d8f")
+                ax.set_title(key)
+                ax.set_xlabel("Seconds")
+                unit = signal_units.get(key) or "scalar"
+                ax.set_ylabel(unit)
+                ax.grid(True, alpha=0.35)
+            for j in range(n, len(axes_list)):
+                axes_list[j].axis("off")
+            fig.suptitle(f"Decoded OBD-II Numeric Signals (Page {page + 1}/{total_pages})")
+            fig.tight_layout()
+            out_name = "obd_signals.png" if total_pages == 1 else f"obd_signals_{page + 1:02d}.png"
+            fig.savefig(outdir / out_name, dpi=150)
+            if not show:
+                plt.close(fig)
     if show:
         plt.show()
         for fig in figs:
@@ -426,6 +432,7 @@ def main() -> int:
 
     decoded_rows: List[Tuple[float, int, str, Optional[float], str]] = []
     numeric_series: Dict[str, List[Tuple[float, float]]] = defaultdict(list)
+    signal_units: Dict[str, str] = {}
     obd_frames = 0
 
     for fr in frames:
@@ -436,10 +443,12 @@ def main() -> int:
             continue
         obd_frames += 1
         pid = fr.data[2]
-        for signal_name, numeric_val, rendered in decoded:
+        for signal_name, numeric_val, rendered, unit in decoded:
             decoded_rows.append((fr.ts, pid, signal_name, numeric_val, rendered))
             if numeric_val is not None:
                 numeric_series[signal_name].append((fr.ts, numeric_val))
+                if signal_name not in signal_units and unit:
+                    signal_units[signal_name] = unit
 
     duration_s = max(frames[-1].ts - frames[0].ts, 1e-6)
     counts = Counter(fr.can_id for fr in frames)
@@ -447,7 +456,13 @@ def main() -> int:
     write_decoded_csv(decoded_rows, outdir / "decoded_obd_signals.csv")
     write_top_ids_csv(counts, len(frames), duration_s, outdir / "top_can_ids.csv")
     plotted = plot_visuals(
-        frames, numeric_series, outdir, show=args.show, resp_min=resp_min, resp_max=resp_max
+        frames,
+        numeric_series,
+        signal_units,
+        outdir,
+        show=args.show,
+        resp_min=resp_min,
+        resp_max=resp_max,
     )
     write_plot_guide(
         outdir / "plot_guide.txt",
@@ -477,7 +492,9 @@ def main() -> int:
         print(f"Wrote: {outdir / 'frame_rate.png'}")
         print(f"Wrote: {outdir / 'top_can_ids.png'}")
         if numeric_series:
-            print(f"Wrote: {outdir / 'obd_signals.png'}")
+            signal_plots = sorted(outdir.glob("obd_signals*.png"))
+            for path in signal_plots:
+                print(f"Wrote: {path}")
         else:
             print("No numeric OBD-II signal series found for plotting.")
         if args.show:
