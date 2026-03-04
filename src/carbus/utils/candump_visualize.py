@@ -190,36 +190,108 @@ def write_decoded_csv(rows: Iterable[Tuple[float, int, str, Optional[float], str
             writer.writerow([f"{ts:.6f}", f"0x{pid:02X}", signal, "" if num is None else num, rendered])
 
 
+def write_top_ids_csv(counts: Counter, total_frames: int, duration_s: float, out_path: Path) -> None:
+    with out_path.open("w", encoding="utf-8", newline="") as f:
+        writer = csv.writer(f)
+        writer.writerow(["can_id_hex", "count", "percent", "rate_hz"])
+        for can_id, count in counts.most_common():
+            pct = (100.0 * count / total_frames) if total_frames else 0.0
+            hz = (count / duration_s) if duration_s > 0 else 0.0
+            writer.writerow([f"0x{can_id:03X}", count, f"{pct:.2f}", f"{hz:.3f}"])
+
+
+def write_plot_guide(
+    out_path: Path,
+    duration_s: float,
+    total_frames: int,
+    obd_frames: int,
+    decoded_rows: int,
+    top_counts: List[Tuple[int, int]],
+    resp_min: int,
+    resp_max: int,
+) -> None:
+    avg_fps = (total_frames / duration_s) if duration_s > 0 else 0.0
+    with out_path.open("w", encoding="utf-8") as f:
+        f.write("Chart Guide\n")
+        f.write("===========\n\n")
+        f.write("frame_rate.png\n")
+        f.write("- X axis: seconds since start of log.\n")
+        f.write("- Y axis: CAN frames per time bin.\n")
+        f.write("- Dashed line: average frame rate across the full log.\n\n")
+        f.write("top_can_ids.png\n")
+        f.write("- Horizontal bars: CAN IDs with the most traffic.\n")
+        f.write("- Labels show count and percent of all frames.\n")
+        f.write(
+            f"- Orange bars are in configured OBD response range: 0x{resp_min:X}..0x{resp_max:X}.\n\n"
+        )
+        f.write("obd_signals.png\n")
+        f.write("- Time series of decoded numeric OBD-II signals (if present).\n")
+        f.write("- Each subplot is one signal decoded from Mode 01 responses.\n\n")
+        f.write("Run Summary\n")
+        f.write("-----------\n")
+        f.write(f"Duration (s): {duration_s:.3f}\n")
+        f.write(f"Total frames: {total_frames}\n")
+        f.write(f"Average frame rate (fps): {avg_fps:.2f}\n")
+        f.write(f"Decoded OBD frames: {obd_frames}\n")
+        f.write(f"Decoded OBD signal rows: {decoded_rows}\n")
+        f.write("Top CAN IDs:\n")
+        for can_id, count in top_counts[:10]:
+            pct = (100.0 * count / total_frames) if total_frames else 0.0
+            f.write(f"- 0x{can_id:03X}: {count} frames ({pct:.2f}%)\n")
+
+
 def plot_visuals(
     frames: List[Frame],
     numeric_signal_series: Dict[str, List[Tuple[float, float]]],
     outdir: Path,
     show: bool,
+    resp_min: int,
+    resp_max: int,
 ) -> bool:
     try:
         import matplotlib.pyplot as plt  # local import for clearer runtime failure
     except ModuleNotFoundError:
         return False
 
+    try:
+        plt.style.use("seaborn-v0_8-whitegrid")
+    except OSError:
+        pass
+
     t0 = frames[0].ts
     t1 = frames[-1].ts
     duration = max(t1 - t0, 1e-6)
 
     # Plot 1: global frame rate over time.
-    bins = max(20, min(300, int(duration)))
+    bin_width_s = 0.5 if duration <= 180 else 1.0
+    bins = max(20, min(400, int(math.ceil(duration / bin_width_s))))
     bucket_counts = [0] * bins
     for fr in frames:
         idx = min(bins - 1, int((fr.ts - t0) / duration * bins))
         bucket_counts[idx] += 1
-    bucket_x = [t0 + (duration * (i + 0.5) / bins) for i in range(bins)]
+    bucket_x = [duration * (i + 0.5) / bins for i in range(bins)]
+    avg_per_bin = sum(bucket_counts) / len(bucket_counts)
+    peak_per_bin = max(bucket_counts) if bucket_counts else 0
     figs = []
 
     fig, ax = plt.subplots(figsize=(12, 4))
     figs.append(fig)
-    ax.plot([x - t0 for x in bucket_x], bucket_counts, linewidth=1.2)
-    ax.set_title("CAN Frame Rate Over Time")
+    ax.plot(bucket_x, bucket_counts, linewidth=1.4, color="#1f77b4")
+    ax.fill_between(bucket_x, bucket_counts, alpha=0.15, color="#1f77b4")
+    ax.axhline(avg_per_bin, linestyle="--", linewidth=1.0, color="#444444", label="Average")
+    ax.set_title("CAN Traffic Intensity Over Time")
     ax.set_xlabel("Seconds since start")
     ax.set_ylabel(f"Frames per ~{duration / bins:.2f}s bin")
+    ax.legend(loc="upper right")
+    ax.text(
+        0.01,
+        0.96,
+        f"Peak/bin: {peak_per_bin}\nAvg/bin: {avg_per_bin:.1f}",
+        transform=ax.transAxes,
+        va="top",
+        fontsize=9,
+        bbox={"facecolor": "white", "alpha": 0.8, "edgecolor": "#BBBBBB"},
+    )
     fig.tight_layout()
     fig.savefig(outdir / "frame_rate.png", dpi=150)
     if not show:
@@ -228,15 +300,31 @@ def plot_visuals(
     # Plot 2: top CAN IDs.
     counts = Counter(fr.can_id for fr in frames)
     top = counts.most_common(20)
-    ids = [f"{cid:03X}" for cid, _ in top]
+    ids = [f"0x{cid:03X}" for cid, _ in top]
     vals = [c for _, c in top]
+    pct = [(100.0 * c / len(frames)) for c in vals]
+    colors = [
+        "#ff7f0e" if resp_min <= cid <= resp_max else "#4c78a8" for cid, _ in top
+    ]
     fig, ax = plt.subplots(figsize=(12, 5))
     figs.append(fig)
-    ax.bar(ids, vals)
+    y = list(range(len(ids)))
+    ax.barh(y, vals, color=colors)
+    ax.set_yticks(y, labels=ids)
+    ax.invert_yaxis()
     ax.set_title("Top CAN IDs by Frame Count")
-    ax.set_xlabel("CAN ID (hex)")
-    ax.set_ylabel("Frame count")
-    ax.tick_params(axis="x", rotation=45)
+    ax.set_xlabel("Frame count")
+    ax.set_ylabel("CAN ID")
+    for i, (count, pct_val) in enumerate(zip(vals, pct)):
+        ax.text(count, i, f"  {count} ({pct_val:.1f}%)", va="center", fontsize=9)
+    ax.text(
+        0.01,
+        0.02,
+        f"Orange = OBD response range 0x{resp_min:X}..0x{resp_max:X}",
+        transform=ax.transAxes,
+        fontsize=9,
+        bbox={"facecolor": "white", "alpha": 0.8, "edgecolor": "#BBBBBB"},
+    )
     fig.tight_layout()
     fig.savefig(outdir / "top_can_ids.png", dpi=150)
     if not show:
@@ -244,11 +332,15 @@ def plot_visuals(
 
     # Plot 3: OBD numeric signals, if any.
     if numeric_signal_series:
-        keys = sorted(numeric_signal_series.keys())[:12]
+        keys = sorted(
+            numeric_signal_series.keys(),
+            key=lambda k: len(numeric_signal_series[k]),
+            reverse=True,
+        )[:12]
         n = len(keys)
-        cols = 2
+        cols = 1 if n <= 4 else 2
         rows = math.ceil(n / cols)
-        fig, axes = plt.subplots(rows, cols, figsize=(14, max(3 * rows, 4)))
+        fig, axes = plt.subplots(rows, cols, figsize=(14, max(3 * rows, 4)), sharex=True)
         figs.append(fig)
         axes_list = axes.flatten() if hasattr(axes, "flatten") else [axes]
         for i, key in enumerate(keys):
@@ -256,13 +348,15 @@ def plot_visuals(
             series = numeric_signal_series[key]
             xs = [x - t0 for x, _ in series]
             ys = [y for _, y in series]
-            ax.plot(xs, ys, linewidth=1.0)
+            ax.plot(xs, ys, linewidth=1.2, color="#2a9d8f")
+            ax.scatter(xs, ys, s=5, alpha=0.35, color="#2a9d8f")
             ax.set_title(key)
             ax.set_xlabel("Seconds")
             ax.set_ylabel("Value")
+            ax.grid(True, alpha=0.35)
         for j in range(n, len(axes_list)):
             axes_list[j].axis("off")
-        fig.suptitle("Decoded OBD-II Numeric Signals")
+        fig.suptitle("Decoded OBD-II Numeric Signals (Top 12 by sample count)")
         fig.tight_layout()
         fig.savefig(outdir / "obd_signals.png", dpi=150)
         if not show:
@@ -347,8 +441,24 @@ def main() -> int:
             if numeric_val is not None:
                 numeric_series[signal_name].append((fr.ts, numeric_val))
 
+    duration_s = max(frames[-1].ts - frames[0].ts, 1e-6)
+    counts = Counter(fr.can_id for fr in frames)
+
     write_decoded_csv(decoded_rows, outdir / "decoded_obd_signals.csv")
-    plotted = plot_visuals(frames, numeric_series, outdir, show=args.show)
+    write_top_ids_csv(counts, len(frames), duration_s, outdir / "top_can_ids.csv")
+    plotted = plot_visuals(
+        frames, numeric_series, outdir, show=args.show, resp_min=resp_min, resp_max=resp_max
+    )
+    write_plot_guide(
+        outdir / "plot_guide.txt",
+        duration_s=duration_s,
+        total_frames=len(frames),
+        obd_frames=obd_frames,
+        decoded_rows=len(decoded_rows),
+        top_counts=counts.most_common(10),
+        resp_min=resp_min,
+        resp_max=resp_max,
+    )
 
     with (outdir / "summary.txt").open("w", encoding="utf-8") as f:
         f.write(f"log: {log_path}\n")
@@ -361,6 +471,8 @@ def main() -> int:
     print(f"Decoded OBD-II frames: {obd_frames}")
     print(f"Wrote: {outdir / 'summary.txt'}")
     print(f"Wrote: {outdir / 'decoded_obd_signals.csv'}")
+    print(f"Wrote: {outdir / 'top_can_ids.csv'}")
+    print(f"Wrote: {outdir / 'plot_guide.txt'}")
     if plotted:
         print(f"Wrote: {outdir / 'frame_rate.png'}")
         print(f"Wrote: {outdir / 'top_can_ids.png'}")
