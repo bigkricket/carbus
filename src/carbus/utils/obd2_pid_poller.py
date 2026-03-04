@@ -1,5 +1,12 @@
 #!/usr/bin/env python3
-"""Scan supported OBD-II Mode 01 PIDs, then poll supported PIDs by JSON rates."""
+"""Query DTC services, scan Mode 01 PIDs, then poll supported PIDs by JSON rates.
+
+Assumptions/limits:
+- Uses 11-bit CAN OBD requests/responses only.
+- Uses single-frame responses only; no ISO-TP multi-frame reassembly.
+- Accepts the first matching positive response from configured response IDs.
+- DTC query covers services 0x03 (stored), 0x07 (pending), and 0x0A (permanent).
+"""
 
 import argparse
 import json
@@ -14,6 +21,11 @@ from carbus.can.SocketCAN import CANFilter, SocketCAN
 
 MODE_CURRENT_DATA = 0x01
 POSITIVE_RESPONSE_BASE = 0x40
+DTC_SERVICES = (
+    (0x03, "stored"),
+    (0x07, "pending"),
+    (0x0A, "permanent"),
+)
 
 
 def parse_can_id(raw: str) -> int:
@@ -27,6 +39,11 @@ def parse_pid_hex(raw: str) -> int:
 def mk_obd_request(mode: int, pid: int) -> bytes:
     # Single-frame OBD-II request payload on 11-bit CAN.
     return bytes([0x02, mode & 0xFF, pid & 0xFF, 0, 0, 0, 0, 0])
+
+
+def mk_obd_service_request(mode: int) -> bytes:
+    # Single-frame OBD-II request for service-only modes (ex: 03/07/0A).
+    return bytes([0x01, mode & 0xFF, 0, 0, 0, 0, 0, 0])
 
 
 def decode_supported_mask(payload: bytes, mode: int, base_pid: int) -> Optional[int]:
@@ -46,10 +63,14 @@ def extract_pid(payload: bytes, mode: int) -> Optional[int]:
     return payload[2]
 
 
+def is_positive_service_response(payload: bytes, mode: int) -> bool:
+    return len(payload) >= 2 and payload[1] == (mode + POSITIVE_RESPONSE_BASE)
+
+
 def wait_for_response(
     sock: SocketCAN,
     mode: int,
-    pid: int,
+    pid: Optional[int],
     timeout_s: float,
     response_ids: Set[int],
 ) -> Optional[bytes]:
@@ -58,10 +79,71 @@ def wait_for_response(
         frame = sock.read()
         if frame.addr not in response_ids:
             continue
-        if extract_pid(frame.data, mode) != pid:
+        if not is_positive_service_response(frame.data, mode):
+            continue
+        if pid is not None and extract_pid(frame.data, mode) != pid:
             continue
         return frame.data
     return None
+
+
+def response_service_data_bytes(payload: bytes, header_len: int) -> bytes:
+    # header_len counts bytes after service byte and before data.
+    if len(payload) < 2 + header_len:
+        return b""
+    reported = int(payload[0])
+    start = 2 + header_len
+    if reported >= (1 + header_len):
+        end = min(len(payload), 1 + reported)
+        return payload[start:end]
+    return payload[start:]
+
+
+def decode_dtc_code(msb: int, lsb: int) -> Optional[str]:
+    if msb == 0 and lsb == 0:
+        return None
+    type_char = "PCBU"[(msb >> 6) & 0x3]
+    first_digit = (msb >> 4) & 0x3
+    value = ((msb & 0x3F) << 8) | lsb
+    return f"{type_char}{first_digit}{value:03X}"
+
+
+def decode_dtc_response(payload: bytes, mode: int) -> List[str]:
+    if not is_positive_service_response(payload, mode):
+        return []
+    dtc_bytes = response_service_data_bytes(payload, header_len=0)
+    out: List[str] = []
+    for i in range(0, len(dtc_bytes) - 1, 2):
+        code = decode_dtc_code(dtc_bytes[i], dtc_bytes[i + 1])
+        if code is not None:
+            out.append(code)
+    return out
+
+
+def query_and_print_dtcs(
+    sock: SocketCAN,
+    request_id: int,
+    response_ids: Set[int],
+    timeout_s: float,
+) -> None:
+    print("Querying DTC services before PID polling...")
+    for mode, label in DTC_SERVICES:
+        sock.write(mk_obd_service_request(mode), request_id, rtr=False)
+        data = wait_for_response(
+            sock=sock,
+            mode=mode,
+            pid=None,
+            timeout_s=timeout_s,
+            response_ids=response_ids,
+        )
+        if data is None:
+            print(f"  {label.title()} DTCs (Mode 0x{mode:02X}): timeout/no response")
+            continue
+        dtcs = decode_dtc_response(data, mode)
+        if dtcs:
+            print(f"  {label.title()} DTCs (Mode 0x{mode:02X}): " + ", ".join(dtcs))
+        else:
+            print(f"  {label.title()} DTCs (Mode 0x{mode:02X}): none")
 
 
 def scan_supported_mode01_pids(
@@ -290,6 +372,13 @@ def main() -> int:
 
     signal.signal(signal.SIGINT, _stop_handler)
     signal.signal(signal.SIGTERM, _stop_handler)
+
+    query_and_print_dtcs(
+        sock=sock,
+        request_id=request_id,
+        response_ids=response_ids,
+        timeout_s=args.timeout,
+    )
 
     print(f"Scanning supported Mode 01 PIDs on {args.interface}...")
     supported_mode01 = scan_supported_mode01_pids(
