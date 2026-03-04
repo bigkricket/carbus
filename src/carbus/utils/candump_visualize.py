@@ -8,12 +8,16 @@ import math
 import re
 from collections import Counter, defaultdict
 from dataclasses import dataclass
+from datetime import datetime
 from pathlib import Path
 from typing import Dict, Iterable, List, Optional, Tuple
 
 
-CANDUMP_RE = re.compile(
+CANDUMP_HASH_RE = re.compile(
     r"^\((?P<ts>\d+\.\d+)\)\s+(?P<iface>\S+)\s+(?P<can_id>[0-9A-Fa-f]+)#(?P<data>[0-9A-Fa-f]*)$"
+)
+CANDUMP_BRACKET_RE = re.compile(
+    r"^\((?P<ts>[^)]+)\)\s+(?P<iface>\S+)\s+(?P<can_id>[0-9A-Fa-f]+)\s+\[(?P<dlc>\d+)\]\s+(?P<data>[0-9A-Fa-f ]*)$"
 )
 
 
@@ -25,19 +29,63 @@ class Frame:
     data: bytes
 
 
+def parse_timestamp(raw: str) -> Optional[float]:
+    try:
+        return float(raw)
+    except ValueError:
+        pass
+    try:
+        return datetime.fromisoformat(raw).timestamp()
+    except ValueError:
+        return None
+
+
 def parse_candump_line(line: str) -> Optional[Frame]:
-    m = CANDUMP_RE.match(line.strip())
-    if not m:
-        return None
-    data_hex = m.group("data")
-    if len(data_hex) % 2 != 0:
-        return None
-    return Frame(
-        ts=float(m.group("ts")),
-        iface=m.group("iface"),
-        can_id=int(m.group("can_id"), 16),
-        data=bytes.fromhex(data_hex),
-    )
+    text = line.strip()
+
+    # Format: "(<ts>) <iface> <canid>#<hexdata>"
+    m_hash = CANDUMP_HASH_RE.match(text)
+    if m_hash:
+        data_hex = m_hash.group("data")
+        if len(data_hex) % 2 != 0:
+            return None
+        ts = parse_timestamp(m_hash.group("ts"))
+        if ts is None:
+            return None
+        return Frame(
+            ts=ts,
+            iface=m_hash.group("iface"),
+            can_id=int(m_hash.group("can_id"), 16),
+            data=bytes.fromhex(data_hex),
+        )
+
+    # Format: "(<ts>) <iface> <canid> [<dlc>] <byte byte ...>"
+    m_bracket = CANDUMP_BRACKET_RE.match(text)
+    if m_bracket:
+        ts = parse_timestamp(m_bracket.group("ts"))
+        if ts is None:
+            return None
+
+        data_hex = "".join(m_bracket.group("data").split())
+        if len(data_hex) % 2 != 0:
+            return None
+
+        try:
+            declared_dlc = int(m_bracket.group("dlc"))
+        except ValueError:
+            return None
+
+        payload = bytes.fromhex(data_hex) if data_hex else b""
+        if len(payload) < declared_dlc:
+            return None
+
+        return Frame(
+            ts=ts,
+            iface=m_bracket.group("iface"),
+            can_id=int(m_bracket.group("can_id"), 16),
+            data=payload[:declared_dlc],
+        )
+    return None
 
 
 def load_frames(path: Path) -> List[Frame]:
