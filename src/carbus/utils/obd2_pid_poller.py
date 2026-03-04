@@ -3,7 +3,8 @@
 
 Assumptions/limits:
 - Uses 11-bit CAN OBD requests/responses only.
-- Uses single-frame responses only; no ISO-TP multi-frame reassembly.
+- Uses ISO-TP reassembly for DTC services (03/07/0A), but Mode 01 polling remains
+  single-frame.
 - Accepts the first matching positive response from configured response IDs.
 - DTC query covers services 0x03 (stored), 0x07 (pending), and 0x0A (permanent).
 """
@@ -46,6 +47,11 @@ def mk_obd_service_request(mode: int) -> bytes:
     return bytes([0x01, mode & 0xFF, 0, 0, 0, 0, 0, 0])
 
 
+def mk_isotp_flow_control() -> bytes:
+    # Continue To Send, no block size limit, no STmin constraint.
+    return bytes([0x30, 0x00, 0x00, 0, 0, 0, 0, 0])
+
+
 def decode_supported_mask(payload: bytes, mode: int, base_pid: int) -> Optional[int]:
     # Typical response: [len, mode+0x40, pid, A, B, C, D, ...]
     if len(payload) < 7:
@@ -65,6 +71,10 @@ def extract_pid(payload: bytes, mode: int) -> Optional[int]:
 
 def is_positive_service_response(payload: bytes, mode: int) -> bool:
     return len(payload) >= 2 and payload[1] == (mode + POSITIVE_RESPONSE_BASE)
+
+
+def is_positive_service_payload(payload: bytes, mode: int) -> bool:
+    return len(payload) >= 1 and payload[0] == (mode + POSITIVE_RESPONSE_BASE)
 
 
 def wait_for_response(
@@ -99,6 +109,62 @@ def response_service_data_bytes(payload: bytes, header_len: int) -> bytes:
     return payload[start:]
 
 
+def wait_for_isotp_service_payload(
+    sock: SocketCAN,
+    mode: int,
+    timeout_s: float,
+    response_ids: Set[int],
+    request_id: int,
+) -> Optional[bytes]:
+    deadline = time.monotonic() + timeout_s
+    while time.monotonic() < deadline:
+        frame = sock.read()
+        if frame.addr not in response_ids or len(frame.data) == 0:
+            continue
+
+        pci = frame.data[0]
+        frame_type = (pci >> 4) & 0xF
+
+        # ISO-TP Single Frame: low nibble is payload length.
+        if frame_type == 0x0:
+            payload_len = pci & 0xF
+            payload = bytes(frame.data[1 : 1 + payload_len])
+            if is_positive_service_payload(payload, mode):
+                return payload
+            continue
+
+        # ISO-TP First Frame: 12-bit payload length across first 2 bytes.
+        if frame_type == 0x1 and len(frame.data) >= 2:
+            total_len = ((pci & 0xF) << 8) | frame.data[1]
+            payload = bytearray(frame.data[2:])
+            if len(payload) > total_len:
+                payload = payload[:total_len]
+            if not payload or not is_positive_service_payload(payload, mode):
+                continue
+
+            # Ask ECU to continue with consecutive frames.
+            sock.write(mk_isotp_flow_control(), request_id, rtr=False)
+
+            expected_sn = 1
+            while len(payload) < total_len and time.monotonic() < deadline:
+                cf = sock.read()
+                if cf.addr not in response_ids or len(cf.data) == 0:
+                    continue
+                cf_type = (cf.data[0] >> 4) & 0xF
+                if cf_type != 0x2:
+                    continue
+                sn = cf.data[0] & 0xF
+                if sn != expected_sn:
+                    continue
+                payload.extend(cf.data[1:])
+                expected_sn = (expected_sn + 1) & 0xF
+
+            if len(payload) >= total_len:
+                return bytes(payload[:total_len])
+            return None
+    return None
+
+
 def decode_dtc_code(msb: int, lsb: int) -> Optional[str]:
     if msb == 0 and lsb == 0:
         return None
@@ -108,12 +174,20 @@ def decode_dtc_code(msb: int, lsb: int) -> Optional[str]:
     return f"{type_char}{first_digit}{value:03X}"
 
 
-def decode_dtc_response(payload: bytes, mode: int) -> List[str]:
-    if not is_positive_service_response(payload, mode):
+def decode_dtc_response_service_payload(payload: bytes, mode: int) -> List[str]:
+    if not is_positive_service_payload(payload, mode):
         return []
-    dtc_bytes = response_service_data_bytes(payload, header_len=0)
+    if len(payload) < 2:
+        return []
+
+    # Most ECUs include a DTC count byte after service response (0x43/0x47/0x4A).
+    declared_count = int(payload[1])
+    dtc_bytes = payload[2:]
+
     out: List[str] = []
     for i in range(0, len(dtc_bytes) - 1, 2):
+        if declared_count > 0 and len(out) >= declared_count:
+            break
         code = decode_dtc_code(dtc_bytes[i], dtc_bytes[i + 1])
         if code is not None:
             out.append(code)
@@ -129,17 +203,17 @@ def query_and_print_dtcs(
     print("Querying DTC services before PID polling...")
     for mode, label in DTC_SERVICES:
         sock.write(mk_obd_service_request(mode), request_id, rtr=False)
-        data = wait_for_response(
+        payload = wait_for_isotp_service_payload(
             sock=sock,
             mode=mode,
-            pid=None,
             timeout_s=timeout_s,
             response_ids=response_ids,
+            request_id=request_id,
         )
-        if data is None:
+        if payload is None:
             print(f"  {label.title()} DTCs (Mode 0x{mode:02X}): timeout/no response")
             continue
-        dtcs = decode_dtc_response(data, mode)
+        dtcs = decode_dtc_response_service_payload(payload, mode)
         if dtcs:
             print(f"  {label.title()} DTCs (Mode 0x{mode:02X}): " + ", ".join(dtcs))
         else:
