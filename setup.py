@@ -11,4 +11,9 @@ setup(
     description="Package to decode and work with OBD2 diagnostics",
     packages=find_packages(where="src"),
     package_dir={"": "src"},
+    entry_points={
+        "console_scripts": [
+            "carbus-uds=carbus.utils.uds_cli:main",
+        ],
+    },
 )
